@@ -1,0 +1,417 @@
+# src/core/react_engine.py
+
+import re
+import json
+import logging
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from datetime import datetime
+
+from src.config.llm_config import LLM_CONFIG
+from src.tools.tool_registry import ToolRegistry
+from src.utils.types import Thought, Action, Observation, ReActState
+
+logger = logging.getLogger(__name__)
+
+
+class ReActEngine:
+    """ReAct 推理引擎，管理思考-行动-观察循环"""
+
+    def __init__(self, tool_registry: ToolRegistry = None, llm_config: Dict = None):
+        """
+        初始化引擎
+        
+        Args:
+            tool_registry: 工具注册表实例，若为None则创建默认
+            llm_config: LLM配置，若为None则使用全局配置
+        """
+        self.llm_config = llm_config or LLM_CONFIG
+        self.tool_registry = tool_registry or ToolRegistry()
+        self.max_iterations = self.llm_config.get("react", {}).get("max_iterations", 5)
+        self.logger = logger
+        
+        # 初始化 LLM 客户端（根据配置选择 Ollama 或其他）
+        self._init_llm_client()
+        
+    def _init_llm_client(self):
+        """初始化 LLM 客户端（支持 Ollama 等）"""
+        if self.llm_config.get("type") == "ollama":
+            import ollama
+            self.llm_client = ollama
+            self.model_name = self.llm_config.get("model", "llama2:13b")
+            self.base_url = self.llm_config.get("base_url", "http://localhost:11434")
+            # 可配置 ollama 客户端地址
+            if self.base_url:
+                self.llm_client.host = self.base_url
+        else:
+            # 可扩展其他 LLM
+            raise ValueError(f"Unsupported LLM type: {self.llm_config.get('type')}")
+    
+    def _call_llm(self, prompt: str, temperature: float = 0.2) -> str:
+        """
+        调用 LLM 生成响应
+        
+        Args:
+            prompt: 输入提示
+            temperature: 温度参数
+            
+        Returns:
+            LLM 输出的文本
+        """
+        try:
+            # 使用 ollama.generate 进行 completion
+            response = self.llm_client.generate(
+                model=self.model_name,
+                prompt=prompt,
+                options={
+                    "temperature": temperature,
+                    "num_predict": 512,  # 限制输出长度
+                }
+            )
+            return response["response"].strip()
+        except Exception as e:
+            self.logger.error(f"LLM call failed: {e}")
+            raise
+    
+    def _build_plan_prompt(self, user_query: str, state: ReActState) -> str:
+        """构造用于规划步骤的 Prompt"""
+        # 系统角色定义
+        system_role = """你是一个智能课程管理与规划助手，运行在 HKBU / COMP 课程体系下。
+
+你具备以下核心能力：
+1. 从课程知识库（RAG）中检索课程信息
+2. 根据用户需求进行课程推荐、排课、冲突检测
+3. 生成课表可视化图表
+4. 回答课程政策、先修关系、学分、学期安排等问题
+
+你必须严格遵循 ReAct 模式进行推理和行动，每一步输出格式如下：
+
+Thought: <你当前对问题的理解>
+Action: <你要调用的工具名称及参数，格式为 tool_name(param1=value1, param2=value2)>
+
+注意：不要输出 Final Answer，只输出 Thought 和 Action。
+当任务完成时，调用 stop() 工具，系统会自动输出最终答案。
+
+## 可用工具（必须严格使用以下名称和参数）
+
+1. rag_search(query: str, top_k: int = 5)
+   - 功能：从课程向量库中检索相关信息
+   - 示例：rag_search("COMP7095 先修课程")
+
+2. optimize_schedule(course_list: list, constraints: dict)
+   - 功能：排课优化，检测时间冲突，返回可行课表
+   - 示例：optimize_schedule(["COMP7095", "COMP7125"], {"max_per_semester": 5})
+
+3. generate_timetable(courses: list, format: str = "weekly")
+   - 功能：生成课表图表（返回图片路径）
+   - 示例：generate_timetable(["COMP7095", "COMP7115"], "weekly")
+
+4. get_course_prerequisites(course_code: str)
+   - 功能：返回某门课程的直接先修课程列表
+   - 示例：get_course_prerequisites("COMP7095")
+
+5. check_semester_availability(course_code: str, semester: str)
+   - 功能：检查某课程在指定学期是否开设
+   - 示例：check_semester_availability("COMP7095", "Semester 2")
+
+6. stop()
+   - 功能：终止当前任务，输出最终答案
+   - 当所有必要信息已获取并可以回答用户时调用
+
+## 课程限制条件（必须遵守）
+- 学生必须先修完 **Prerequisites** 中的课程，才能选修后续课程
+- 同一学期不建议选修超过 5 门课程
+- 课程仅限 COMP / GCAP / GFHC 系列
+- 若用户未指定专业，默认使用“MSc in IT Management”或“Creative Media”
+- 若课程时间冲突，必须提示用户并建议调整
+
+## 回答风格
+- 使用中文推理，但课程代码和专业名称保留英文
+- 必须基于 RAG 检索结果，不得编造课程信息
+- 若信息不足，后续 Action 应继续检索或直接调用 stop() 并说明“无法确认”
+"""
+        # 历史步骤
+        history = ""
+        if state.thoughts or state.actions or state.observations:
+            history += "\n## 历史交互\n"
+            max_steps = min(len(state.thoughts), 5)
+            for i in range(max_steps):
+                if i < len(state.thoughts):
+                    history += f"Thought {i+1}: {state.thoughts[i].content}\n"
+                if i < len(state.actions):
+                    history += f"Action {i+1}: {state.actions[i].to_json()}\n"
+                if i < len(state.observations):
+                    history += f"Observation {i+1}: {state.observations[i].result}\n"
+                history += "\n"
+        
+        # 用户请求
+        user_section = f"\n## 用户原始请求\n{user_query}\n"
+        
+        # 当前状态
+        current_state = "\n## 当前状态\n"
+        if state.observations and not state.actions:
+            current_state += "刚刚完成了一次观察，请根据观察结果决定下一步行动。\n"
+        elif len(state.actions) > 0 and len(state.observations) == len(state.actions):
+            current_state += "上一轮行动已完成，请根据观察结果继续推理。\n"
+        else:
+            current_state += "任务开始，请根据用户请求规划第一步行动。\n"
+        
+        # 输出格式
+        output_format = """
+## 输出格式（严格遵守）
+只输出以下两行，不要包含任何额外解释：
+
+Thought: <你的推理>
+Action: <工具调用，或 stop()>
+"""
+        full_prompt = system_role + "\n" + history + "\n" + user_section + current_state + output_format + "\nThought:"
+        return full_prompt
+    
+    def _parse_react_output(self, llm_output: str) -> Tuple[str, str]:
+        """
+        解析 LLM 输出的 Thought 和 Action
+        
+        Args:
+            llm_output: LLM 返回的文本
+            
+        Returns:
+            (thought, action_str)
+        """
+        thought = ""
+        action_str = ""
+        
+        # 提取 Thought
+        thought_match = re.search(r"Thought:\s*(.+?)(?=\nAction:|$)", llm_output, re.DOTALL)
+        if thought_match:
+            thought = thought_match.group(1).strip()
+        
+        # 提取 Action
+        action_match = re.search(r"Action:\s*(.+)", llm_output)
+        if action_match:
+            action_str = action_match.group(1).strip()
+        
+        if not thought:
+            thought = "无法解析思考过程"
+            self.logger.warning(f"Failed to parse Thought from: {llm_output[:200]}")
+        if not action_str:
+            action_str = "stop()"
+            self.logger.warning("No Action found, defaulting to stop()")
+        
+        return thought, action_str
+    
+    def _parse_action_call(self, action_str: str) -> Tuple[str, Dict[str, Any]]:
+        """
+        解析 Action 字符串，提取工具名称和参数
+        
+        支持格式：
+        - tool_name()
+        - tool_name(param=value)
+        - tool_name(param1=value1, param2=value2)
+        
+        Args:
+            action_str: 如 'rag_search(query="COMP7095", top_k=3)'
+            
+        Returns:
+            (tool_name, arguments_dict)
+        """
+        # 匹配函数名和参数部分
+        pattern = r"(\w+)\((.*)\)"
+        match = re.match(pattern, action_str.strip())
+        if not match:
+            raise ValueError(f"Invalid action format: {action_str}")
+        
+        tool_name = match.group(1)
+        args_str = match.group(2).strip()
+        
+        # 解析参数
+        args = {}
+        if args_str:
+            # 简单解析 key=value，支持字符串、数字、列表、布尔
+            # 使用正则匹配 key=value 对，注意 value 可能包含引号、方括号等
+            # 更健壮的方式是用 ast.literal_eval，但这里简化处理
+            arg_pattern = r"(\w+)=((?:[^,)]+|\[.*?\]|'.*?'|\".*?\"))"
+            for k, v in re.findall(arg_pattern, args_str):
+                # 尝试转换为 Python 对象
+                v = v.strip()
+                if v.lower() == 'true':
+                    args[k] = True
+                elif v.lower() == 'false':
+                    args[k] = False
+                elif v.isdigit():
+                    args[k] = int(v)
+                elif v.replace('.', '', 1).isdigit():
+                    args[k] = float(v)
+                elif v.startswith('[') and v.endswith(']'):
+                    # 简单列表解析，仅支持字符串列表如 ["a","b"]
+                    items = re.findall(r'"([^"]+)"', v)
+                    args[k] = items
+                elif (v.startswith("'") and v.endswith("'")) or (v.startswith('"') and v.endswith('"')):
+                    args[k] = v[1:-1]
+                else:
+                    args[k] = v
+        return tool_name, args
+    
+    def _execute_action(self, action: Action) -> Observation:
+        """
+        执行 Action，返回 Observation
+        
+        Args:
+            action: Action 对象，包含 tool_name 和 arguments
+            
+        Returns:
+            Observation 对象
+        """
+        tool_name = action.tool_name
+        args = action.arguments
+        
+        try:
+            # 如果是 stop 工具，直接返回成功标志
+            if tool_name == "stop":
+                return Observation(
+                    result="STOP",
+                    success=True,
+                    metadata={"action": "stop"}
+                )
+            
+            # 从工具注册表获取工具
+            tool = self.tool_registry.get_tool(tool_name)
+            if not tool:
+                raise ValueError(f"Tool '{tool_name}' not found in registry")
+            
+            # 执行工具
+            result = tool.execute(**args)
+            
+            # 将结果转换为字符串（用于 Observation）
+            if isinstance(result, dict):
+                result_str = json.dumps(result, ensure_ascii=False)
+            elif isinstance(result, list):
+                result_str = json.dumps(result, ensure_ascii=False)
+            else:
+                result_str = str(result)
+            
+            return Observation(
+                result=result_str,
+                success=True,
+                metadata={"tool": tool_name, "args": args}
+            )
+        except Exception as e:
+            self.logger.error(f"Action execution failed: {e}")
+            return Observation(
+                result=f"执行失败: {str(e)}",
+                success=False,
+                metadata={"tool": tool_name, "args": args, "error": str(e)}
+            )
+    
+    def run(self, user_query: str, max_iterations: int = None) -> ReActState:
+        """
+        运行 ReAct 主循环
+        
+        Args:
+            user_query: 用户输入的自然语言查询
+            max_iterations: 最大迭代次数，默认使用配置中的值
+            
+        Returns:
+            包含完整执行历史的 ReActState
+        """
+        max_iter = max_iterations or self.max_iterations
+        state = ReActState(
+            user_query=user_query,
+            start_time=datetime.now()
+        )
+        
+        for iteration in range(max_iter):
+            self.logger.info(f"ReAct iteration {iteration + 1}/{max_iter}")
+            
+            # 1. 构建 Prompt 并调用 LLM 获取 Thought 和 Action
+            prompt = self._build_plan_prompt(user_query, state)
+            llm_output = self._call_llm(prompt, temperature=0.2)
+            thought_text, action_str = self._parse_react_output(llm_output)
+            
+            # 记录 Thought
+            thought = Thought(content=thought_text, step=iteration)
+            state.thoughts.append(thought)
+            
+            # 2. 解析 Action
+            try:
+                tool_name, args = self._parse_action_call(action_str)
+                action = Action(tool_name=tool_name, arguments=args, step=iteration)
+            except Exception as e:
+                self.logger.error(f"Action parsing failed: {e}")
+                # 生成一个错误 Action 并停止
+                action = Action(tool_name="stop", arguments={}, step=iteration)
+                state.actions.append(action)
+                obs = Observation(
+                    result=f"无法解析 Action: {e}，任务终止。",
+                    success=False,
+                    metadata={"error": str(e)}
+                )
+                state.observations.append(obs)
+                break
+            
+            state.actions.append(action)
+            
+            # 3. 执行 Action
+            observation = self._execute_action(action)
+            state.observations.append(observation)
+            
+            # 4. 检查是否应该停止
+            if action.tool_name == "stop" or observation.result == "STOP":
+                self.logger.info("Stop signal received, ending loop.")
+                break
+            
+            # 如果工具执行失败且无法恢复，也可选择停止（根据需求）
+            if not observation.success and action.tool_name != "stop":
+                self.logger.warning(f"Action {action.tool_name} failed, but continuing...")
+        
+        state.end_time = datetime.now()
+        state.completed = True
+        
+        # 生成最终答案（基于最后的观察和历史）
+        final_answer = self._generate_final_answer(state)
+        state.final_answer = final_answer
+        
+        return state
+    
+    def _generate_final_answer(self, state: ReActState) -> str:
+        """
+        基于 ReAct 执行历史生成最终答案给用户
+        
+        Args:
+            state: 执行状态
+            
+        Returns:
+            最终答案字符串
+        """
+        # 如果有 stop 工具后的观察结果，优先使用
+        for obs in reversed(state.observations):
+            if obs.metadata.get("action") == "stop" and obs.success:
+                return obs.result
+        
+        # 否则调用 LLM 生成综合答案
+        prompt = f"""根据以下 ReAct 执行过程，为用户生成一个简洁、有用的最终答案。
+
+用户原始问题：{state.user_query}
+
+执行历史：
+"""
+        for i in range(len(state.thoughts)):
+            if i < len(state.thoughts):
+                prompt += f"Step {i+1}:\n"
+                prompt += f"Thought: {state.thoughts[i].content}\n"
+            if i < len(state.actions):
+                prompt += f"Action: {state.actions[i].to_json()}\n"
+            if i < len(state.observations):
+                prompt += f"Observation: {state.observations[i].result}\n"
+            prompt += "\n"
+        
+        prompt += """请输出最终答案（使用中文，可直接回复用户）：
+Final Answer:"""
+        
+        try:
+            final = self._call_llm(prompt, temperature=0.3)
+            # 移除可能的 "Final Answer:" 前缀
+            final = re.sub(r"^Final Answer:\s*", "", final.strip())
+            return final
+        except Exception as e:
+            self.logger.error(f"Final answer generation failed: {e}")
+            return "抱歉，生成答案时遇到问题。请稍后重试。"
